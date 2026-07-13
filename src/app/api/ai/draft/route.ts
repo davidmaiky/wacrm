@@ -3,8 +3,12 @@ import { requireRole, toErrorResponse } from '@/lib/auth/account'
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { loadAiConfig } from '@/lib/ai/config'
 import { buildConversationContext } from '@/lib/ai/context'
+import { retrieveKnowledge } from '@/lib/ai/knowledge'
 import { generateReply } from '@/lib/ai/generate'
 import { buildSystemPrompt } from '@/lib/ai/defaults'
+import { latestUserMessage } from '@/lib/ai/query'
+import { logAiUsage } from '@/lib/ai/usage'
+import { supabaseAdmin } from '@/lib/ai/admin-client'
 import { AiError } from '@/lib/ai/types'
 
 /**
@@ -85,12 +89,43 @@ export async function POST(request: Request) {
       )
     }
 
+    // Ground the draft in the account's knowledge base (best-effort —
+    // returns [] when there's no KB or retrieval fails).
+    const knowledge = await retrieveKnowledge(
+      supabase,
+      accountId,
+      config,
+      latestUserMessage(messages),
+    )
+
     const systemPrompt = buildSystemPrompt({
       userPrompt: config.systemPrompt,
       mode: 'draft',
+      knowledge,
     })
 
-    const { text } = await generateReply({ config, systemPrompt, messages })
+    const { text, usage } = await generateReply({ config, systemPrompt, messages })
+
+    // Record spend on the account's BYO key. Best-effort + via the
+    // service role (the log has no `authenticated` INSERT policy). This
+    // must not fail or delay the draft the agent is waiting on, so:
+    //  - the whole thing is wrapped (constructing the admin client throws
+    //    if the service-role key is unset — that must not 500 the draft);
+    //  - it's fire-and-forget (`void`), not awaited, so the response
+    //    isn't held for a DB round-trip.
+    try {
+      void logAiUsage(supabaseAdmin(), {
+        accountId,
+        conversationId,
+        mode: 'draft',
+        provider: config.provider,
+        model: config.model,
+        usage,
+      })
+    } catch (logErr) {
+      console.error('[ai/draft] usage log skipped:', logErr)
+    }
+
     return NextResponse.json({ draft: text })
   } catch (err) {
     if (err instanceof AiError) {

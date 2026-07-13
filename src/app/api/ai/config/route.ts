@@ -7,6 +7,7 @@ import {
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
 import { validateAiCredentials } from '@/lib/ai/validate'
+import { embedTexts } from '@/lib/ai/embeddings'
 import { AiError, type AiProvider } from '@/lib/ai/types'
 
 function bad(message: string) {
@@ -29,7 +30,7 @@ export async function GET() {
       // `api_key` is selected only to derive `has_key` — it is stripped
       // out below and never returned to the client.
       .select(
-        'provider, model, system_prompt, is_active, auto_reply_enabled, auto_reply_max_per_conversation, api_key',
+        'provider, model, system_prompt, is_active, auto_reply_enabled, auto_reply_max_per_conversation, handoff_agent_id, api_key, embeddings_api_key',
       )
       .eq('account_id', accountId)
       .maybeSingle()
@@ -43,8 +44,15 @@ export async function GET() {
     }
 
     if (!data) return NextResponse.json({ configured: false })
-    const { api_key, ...safe } = data
-    return NextResponse.json({ configured: true, has_key: !!api_key, ...safe })
+    // The keys are selected only to derive the has_* flags; neither is
+    // returned to the client.
+    const { api_key, embeddings_api_key, ...safe } = data
+    return NextResponse.json({
+      configured: true,
+      has_key: !!api_key,
+      has_embeddings_key: !!embeddings_api_key,
+      ...safe,
+    })
   } catch (err) {
     return toErrorResponse(err)
   }
@@ -87,7 +95,35 @@ export async function POST(request: Request) {
     if (!Number.isFinite(maxPer)) maxPer = 3
     maxPer = Math.min(20, Math.max(1, Math.floor(maxPer)))
 
+    // Handoff routing target for auto-reply. A non-empty string must be a
+    // member of this account (else the conversation would be assigned to a
+    // stranger); an empty string / null means "leave unassigned" (the
+    // shared queue). Absent → left unchanged on update below.
+    const rawHandoff =
+      typeof body.handoff_agent_id === 'string' ? body.handoff_agent_id.trim() : ''
+    const handoffProvided = 'handoff_agent_id' in body
+    let handoffAgentId: string | null = null
+    if (rawHandoff) {
+      const { data: member } = await supabase
+        .from('profiles')
+        .select('user_id')
+        .eq('account_id', accountId)
+        .eq('user_id', rawHandoff)
+        .maybeSingle()
+      if (!member) return bad('handoff_agent_id must be a member of this account')
+      handoffAgentId = rawHandoff
+    }
+
     const rawKey = typeof body.api_key === 'string' ? body.api_key.trim() : ''
+
+    // Embeddings key (optional, for semantic KB search): a non-empty
+    // string sets/replaces it; an explicit null clears it; absent leaves
+    // it unchanged. The form only sends it when the admin edits it.
+    const rawEmbeddingsKey =
+      typeof body.embeddings_api_key === 'string'
+        ? body.embeddings_api_key.trim()
+        : ''
+    const clearEmbeddingsKey = body.embeddings_api_key === null
 
     // Reuse the stored key when the form didn't send a fresh one.
     const { data: existing } = await supabase
@@ -129,6 +165,8 @@ export async function POST(request: Request) {
           isActive,
           autoReplyEnabled,
           autoReplyMaxPerConversation: maxPer,
+          handoffAgentId: null,
+          embeddingsApiKey: null,
         })
       } catch (err) {
         if (err instanceof AiError) {
@@ -142,14 +180,39 @@ export async function POST(request: Request) {
       }
     }
 
+    // Validate a new embeddings key before storing (a cheap 1-input
+    // embed), same "verify before save" discipline as the chat key.
+    if (rawEmbeddingsKey) {
+      try {
+        await embedTexts(rawEmbeddingsKey, ['ping'])
+      } catch (err) {
+        if (err instanceof AiError) {
+          return NextResponse.json(
+            { error: `Embeddings key: ${err.message}`, code: err.code },
+            { status: 400 },
+          )
+        }
+        console.error('[ai/config POST] embeddings validation error:', err)
+        return bad('Could not validate the embeddings key.')
+      }
+    }
+
     const encryptedKey = rawKey ? encrypt(rawKey) : null
-    const shared = {
+    const shared: Record<string, unknown> = {
       provider,
       model,
       system_prompt: systemPrompt,
       is_active: isActive,
       auto_reply_enabled: autoReplyEnabled,
       auto_reply_max_per_conversation: maxPer,
+    }
+    // Only touch the handoff target when the form actually sent the field,
+    // so a partial save (e.g. flipping a toggle) doesn't wipe it.
+    if (handoffProvided) shared.handoff_agent_id = handoffAgentId
+    if (rawEmbeddingsKey) {
+      shared.embeddings_api_key = encrypt(rawEmbeddingsKey)
+    } else if (clearEmbeddingsKey) {
+      shared.embeddings_api_key = null
     }
 
     if (existing) {
